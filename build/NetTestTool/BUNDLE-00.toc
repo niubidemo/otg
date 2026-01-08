@@ -1,0 +1,3 @@
+([('NetTestTool',
+   '/Users/a1-6/Documents/other/otg/dist/NetTestTool',
+   'EXECUTABLE')],)
