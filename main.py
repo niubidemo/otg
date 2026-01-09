@@ -131,6 +131,24 @@ class AdbWorker(QThread):
         else:
             return f"{status_str} (无互联网访问)"
 
+    def get_brand(self):
+        """获取手机品牌"""
+        return self.run_cmd(["shell", "getprop", "ro.product.brand"])
+
+    def capture_bugreport(self, save_dir):
+        """抓取全量日志 (等同于 284 log)"""
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir, exist_ok=True)
+        
+        # adb bugreport 会生成 zip 文件
+        filename = f"bugreport_{int(time.time())}"
+        full_path = os.path.join(save_dir, filename)
+        
+        # 注意: bugreport 命令非常耗时 (1-3分钟)
+        # 传递给 bugreport 的参数是文件前缀或目录
+        self.run_cmd(["bugreport", full_path])
+        return full_path + ".zip"
+
 class NetworkMonitor(QThread):
     """测试期间持续监控网络连通性及网速"""
     error_signal = pyqtSignal(str) # 发送错误信息
@@ -223,6 +241,39 @@ class NetworkMonitor(QThread):
         self.running = False
         self.wait()
 
+class BugReportThread(QThread):
+    finished_signal = pyqtSignal(str, str) # path, error_msg
+
+    def __init__(self, adb_worker, error_msg):
+        super().__init__()
+        self.adb_worker = adb_worker
+        self.error_msg = error_msg
+
+    def run(self):
+        try:
+            # 1. 获取型号构建目录名
+            date_str = time.strftime("%Y-%m-%d")
+            model = self.adb_worker.run_cmd(["shell", "getprop", "ro.product.model"])
+            if not model: model = "Unknown"
+            model = model.strip().replace(" ", "_")
+            
+            dir_name = f"{date_str}-{model}-NetworkError"
+            
+            # 2. 确定保存路径 (当前 exe 同级目录)
+            if getattr(sys, 'frozen', False):
+                base_path = os.path.dirname(sys.executable)
+            else:
+                base_path = os.getcwd()
+                
+            save_dir = os.path.join(base_path, dir_name)
+            
+            # 3. 执行抓取
+            self.adb_worker.capture_bugreport(save_dir)
+            
+            self.finished_signal.emit(save_dir, self.error_msg)
+        except Exception as e:
+            self.finished_signal.emit("", str(e))
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -234,6 +285,7 @@ class MainWindow(QMainWindow):
         self.test_duration = 30
         self.remaining_time = 30
         self.is_testing = False
+        self.has_triggered_bugreport = False # 防止重复触发日志抓取
         
         # UI 组件初始化
         self.setup_ui()
@@ -405,6 +457,7 @@ class MainWindow(QMainWindow):
         self.start_new_test()
 
     def start_new_test(self):
+        self.has_triggered_bugreport = False
         if not self.adb_thread.device_id:
             QMessageBox.warning(self, "错误", "未连接设备！")
             return
@@ -468,7 +521,44 @@ class MainWindow(QMainWindow):
     def on_net_error(self, error_msg):
         """网络异常回调"""
         self.stop_test_internal(is_pause=False)
+        
+        # 检查是否需要触发日志抓取 (仅针对小米/红米设备)
+        if not self.has_triggered_bugreport:
+            brand = self.adb_thread.get_brand()
+            # 简单判断是否包含 xiaomi 或 redmi (不区分大小写)
+            is_xiaomi = brand and ("xiaomi" in brand.lower() or "redmi" in brand.lower())
+            
+            if is_xiaomi:
+                self.has_triggered_bugreport = True
+                
+                # 弹窗提示 (非模态，但让用户知道在干嘛)
+                self.log_dialog = QMessageBox(self)
+                self.log_dialog.setWindowTitle("正在抓取日志")
+                self.log_dialog.setIcon(QMessageBox.Icon.Information)
+                self.log_dialog.setText("⚠️ 检测到网络异常 (红米/小米设备)\n\n正在自动生成全量系统日志 (类似 284 Log)...\n保存位置: 程序同级目录\n\n⏳ 请耐心等待 1-3 分钟，期间请勿断开手机！")
+                self.log_dialog.setStandardButtons(QMessageBox.StandardButton.NoButton) # 禁用按钮，强制等待
+                self.log_dialog.show()
+                
+                # 启动抓取线程
+                self.bugreport_thread = BugReportThread(self.adb_thread, error_msg)
+                self.bugreport_thread.finished_signal.connect(self.on_bugreport_finished)
+                self.bugreport_thread.start()
+                return # 暂不显示错误弹窗，等日志抓完再显示
+
+        # 如果不是小米设备或已抓取过，直接显示错误
         QMessageBox.critical(self, "测试异常中止", f"❌ 检测到网络故障！\n\n{error_msg}\n\n测试已立即停止。")
+
+    def on_bugreport_finished(self, save_path, error_msg):
+        """日志抓取完成回调"""
+        if self.log_dialog:
+            self.log_dialog.accept() # 关闭进度弹窗
+            
+        if save_path:
+            msg = f"❌ 检测到网络故障！\n\n{error_msg}\n\n✅ 系统日志已保存至:\n{save_path}"
+        else:
+            msg = f"❌ 检测到网络故障！\n\n{error_msg}\n\n⚠️ 日志抓取失败: {error_msg}" # 这里的 error_msg 可能是异常信息
+            
+        QMessageBox.critical(self, "测试异常中止", msg)
 
     def update_net_speed(self, speed_text):
         """更新网速显示"""
